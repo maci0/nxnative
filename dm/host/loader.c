@@ -11,6 +11,9 @@
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
 #include "hle.h"
+#ifdef __linux__
+#include "linux_tls.h"
+#endif
 #if TARGET_OS_IPHONE
 #include <mach/mach.h>
 #endif
@@ -27,11 +30,20 @@ uint64_t resolve_import(module_t *m, const char *name);
 int hle_implements(const char *name);
 void gate_register(uint64_t ret_addr, const char *kind, int arg, uint64_t orig);
 
+#ifndef __linux__
 static pthread_key_t key_value(unsigned i) {
     switch (i) {
     case KEY_K18: return g_key18; case KEY_KTLS: return g_keytls; case KEY_KTLR: return g_keytlr;
     default: return g_keygate;
     }
+}
+#endif
+static uint64_t key_offset(unsigned i) {
+#ifdef __linux__
+    return dm_linux_slot_offset(i);
+#else
+    return (uint64_t)key_value(i) * 8;
+#endif
 }
 static void create_keys(void) {
     if (pthread_key_create(&g_key18, NULL) || pthread_key_create(&g_keytls, NULL) ||
@@ -39,13 +51,21 @@ static void create_keys(void) {
     LOG("key numbers K18=%lu KTLS=%lu KTLR=%lu KGATE=%lu", g_key18, g_keytls, g_keytlr, g_keygate);
 }
 
-// K slot check: the pthread TSD layout is fixed, slot = tpidrro_el0 + 8*key
+// K slot check: the key page offsets must resolve from the host thread pointer.
 static void tsd_check(void) {
     pthread_setspecific(g_key18, (void *)0x1234);
+#ifdef __linux__
+    dm_linux_slots[KEY_K18] = 0x1234;
+    uint64_t base; __asm__ volatile("mrs %0, tpidr_el0" : "=r"(base));
+#else
     uint64_t base; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(base));
+#endif
     uint64_t off = *(uint64_t *)(g_mod[0].base + g_mod[0].key_page_off + g_mod[0].key_idx[KEY_K18] * 8);
-    if (((uint64_t *)(base & ~7ull))[off / 8] != 0x1234) die("TSD layout mismatch");
+    if (*(uint64_t *)(uintptr_t)(base + off) != 0x1234) die("TSD layout mismatch");
     pthread_setspecific(g_key18, 0);
+#ifdef __linux__
+    dm_linux_slots[KEY_K18] = 0;
+#endif
 }
 
 static void build_symhash(module_t *m);
@@ -327,10 +347,12 @@ void dm_fps_state_apply(void) {
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f, hi = g_render_scale_max;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= hi)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to %.1f; keeping the game's size", rs, hi); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
-    // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
-    // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
-    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
-    if (dr && strcmp(dr, "0") && strcmp(dr, "1")) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0 or 1; keeping full resolution", dr);
+    // The game's own dynamic resolution: 0 holds full size, 1 uses its controller, 2..17 pin level 0..15 where the stub supports it.
+    const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = 0;
+    if (dr) { char *end; unsigned long v = strtoul(dr, &end, 10);
+        if (end == dr || *end || v > 17) LOG("[RED] DM_DYNAMIC_RESOLUTION=%s: must be 0..17; keeping full resolution", dr);
+        else dyn = (uint32_t)v;
+    }
     memcpy(dm_fps_state + 0x40, &dyn, sizeof dyn);
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
@@ -375,7 +397,7 @@ static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);
     uint64_t *page = (uint64_t *)(m->base + m->key_page_off);
     memset(page, 0, m->key_page_size);
-    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = (uint64_t)key_value(i) * 8;
+    for (unsigned i = 0; i < KEY_N; i++) page[m->key_idx[i]] = key_offset(i);
     for (int k = 0; k < KEY_N; k++) if (!page[m->key_idx[k]]) die("%s: key page entry %d is 0 (host key not created) -- the game would read TSD slot 0", m->name, k);
     if (mprotect(m->base + m->key_page_off, m->key_page_size, PROT_READ)) die("%s key page mprotect", m->name);
     if (m->fps_state_off) install_fps_state(m);
@@ -802,6 +824,9 @@ static void map_image(module_t *m, const char *dir) {
     m->base = (uint8_t *)base; install_key_page(m);
 }
 #else
+#ifdef __linux__
+#include "linux_guest_alias.h"
+#endif
 static uint8_t *slurp(const char *path, size_t *n) {
     int fd = open(path, O_RDONLY);
     if (fd < 0) die("open %s", path);
@@ -824,13 +849,20 @@ static void map_image(module_t *m, const char *dir) {
         m->size = m->image_size; m->patch_len = (sz - bl - fl + 0x3FFF) & ~0x3FFFull;
         if (m->patch_len > pre) die("%s patch area of %#llx bytes does not fit in the %#llx before the base", path, (unsigned long long)m->patch_len, (unsigned long long)pre);
         uint8_t *slot = jit_slot(m, m->size, pre);
-        uint8_t *a = mmap(slot ? slot - pre : NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
+        uint8_t *a;
+#ifdef __linux__
+        if (dm_linux_guest_alias_enabled()) {
+            if (slot) die("native guest alias cannot use a JIT image layout");
+            a = dm_linux_guest_alias_alloc(pre + m->size);
+        } else
+#endif
+        a = mmap(slot ? slot - pre : NULL, pre + m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
         if (a == MAP_FAILED) die("%s mmap %#llx", m->name, (unsigned long long)(pre + m->size));
         m->base = a + pre;
         memcpy(m->base, raw, fl); memcpy(a, raw + fl, sz - bl - fl); if (bl) memcpy(m->base + m->back_off, raw + sz - bl, bl);
         free(raw); install_key_page(m);
         if (bl && mprotect(m->base + m->back_off, bl, PROT_READ | PROT_EXEC)) die("%s mprotect back patch", m->name);
-        uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+        uint64_t rx = (m->text_end + dm_code_page_mask()) & ~dm_code_page_mask();
         if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
         if (mprotect(a, m->patch_len, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);
         if (pre > m->patch_len && mprotect(a + m->patch_len, pre - m->patch_len, PROT_NONE)) die("%s mprotect gap", m->name);
@@ -838,10 +870,16 @@ static void map_image(module_t *m, const char *dir) {
     }
     m->size = (sz + 0x3FFF) & ~0x3FFFull;
     uint8_t *slot = jit_slot(m, m->size, 0);
+#ifdef __linux__
+    if (dm_linux_guest_alias_enabled()) {
+        if (slot) die("native guest alias cannot use a JIT image layout");
+        m->base = dm_linux_guest_alias_alloc(m->size);
+    } else
+#endif
     m->base = mmap(slot, m->size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | (slot ? MAP_FIXED : 0), -1, 0);
     if (m->base == MAP_FAILED) die("%s mmap", m->name);
     memcpy(m->base, raw, sz); free(raw); install_key_page(m);
-    uint64_t rx = (m->text_end + 0x3FFF) & ~0x3FFFull;
+    uint64_t rx = (m->text_end + dm_code_page_mask()) & ~dm_code_page_mask();
     if (mprotect(m->base, rx, PROT_READ | PROT_EXEC)) die("%s mprotect text", m->name);
     uint64_t po = m->patch_off & ~0x3FFFull;
     if (mprotect(m->base + po, m->size - po, PROT_READ | PROT_EXEC)) die("%s mprotect patch", m->name);

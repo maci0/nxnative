@@ -23,6 +23,10 @@ static void run(sim *m, int n, double w, int kmin, int kmax, int fixed) {
 static void hitch(sim *m) { run(m, 6, 1.6, 1, 3, 0); }
 
 int main(void) {
+    check(nvn_fstep_elapsed_ns(10, 0) == 1 && nvn_fstep_elapsed_ns(10, 10) == 1 &&
+          nvn_fstep_elapsed_ns(10, 11) == 1 && nvn_fstep_elapsed_ns(16666677, 10) == 1 &&
+          nvn_fstep_elapsed_ns(33333344, 10) == 2 && nvn_fstep_elapsed_ns(100000010, 10) == 3,
+          "Hookshot present timestamps yield 1–3 vsync steps, including first and reversed timestamps");
     {   // 120 fps (hle_nvn.c fps_high): kmin 1, kmax 2, in ticks of 1/120 s. The target follows the hold, so a hold above what frames take is the game at the right speed
         sim m = {0}; m.s.per_vsync = 2; m.s.no_payback = 1;
         run(&m, 120, 0.7, 1, 2, 0); check(m.s.k == 1, "120 fps: frames of 5.8 ms hold 120");

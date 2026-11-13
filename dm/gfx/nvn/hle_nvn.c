@@ -61,6 +61,43 @@ void *nvn_big_real[NVN_NFUNC];            // the real implementation of function
 void *nvn_real[NVN_NFUNC];               // DM_NVN_PROF: the real implementation called by the timing wrapper
 _Atomic uint64_t nvn_prof_ticks[NVN_NFUNC]; // DM_NVN_PROF: cumulative time of each function (cntvct counts)
 static uint8_t g_unimpl_seen[NVN_NFUNC];
+#ifdef __linux__
+extern void *hos_nvn_host_impl(const char *name) __attribute__((weak));
+extern int rx_option(int id, int otherwise) __attribute__((weak));
+extern void nvn_hookshot_entry(void);
+static void (*g_hookshot_impl[NVN_NFUNC])(void *, void *);
+static unsigned g_hookshot_present_slot = NVN_NFUNC;
+static int g_hookshot_trace;
+extern uint8_t *dm_fps_state;
+void nvn_hookshot_dispatch(void *ctx, nvn_slot_t *slot) {
+    unsigned i = (unsigned)(slot - nvn_slot);
+    if (i >= NVN_NFUNC || !g_hookshot_impl[i]) die("Hookshot NVN function %s is not implemented", i < NVN_NFUNC ? nvn_names[i] : "(invalid slot)");
+    static _Atomic unsigned trace_calls;
+    if (g_hookshot_trace && atomic_fetch_add(&trace_calls, 1) < 100) {
+        const uint64_t *x = ctx;
+        LOG("[nvn bridge] %s x0=%#llx x1=%#llx x2=%#llx x3=%#llx", nvn_names[i],
+            (unsigned long long)x[0], (unsigned long long)x[1], (unsigned long long)x[2], (unsigned long long)x[3]);
+    }
+    g_hookshot_impl[i](ctx, NULL);
+    if (i == g_hookshot_present_slot && dm_fps_state) {
+        // Direct Hookshot NVN bypasses NxNative's present tick; feed the rewritten game's next frame step.
+        static _Atomic uint64_t previous;
+        const uint64_t now = now_ns();
+        const uint64_t last = atomic_exchange(&previous, now);
+        __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)nvn_fstep_elapsed_ns(now, last), __ATOMIC_RELAXED);
+        if (rx_option && !getenv("DM_DYNAMIC_RESOLUTION")) {
+            const uint32_t dynamic = rx_option(2, 0) != 0;
+            __atomic_store_n((uint32_t *)(dm_fps_state + 0x40), dynamic, __ATOMIC_RELAXED);
+        }
+        if (rx_option && !getenv("DM_RENDER_SCALE") && !getenv("DM_DYNAMIC_RESOLUTION")) {
+            const int scale = rx_option(3, 10000);
+            const float fraction = scale > 0 && scale <= 10000 ? scale / 10000.0f : 1.0f;
+            uint32_t bits; memcpy(&bits, &fraction, sizeof bits);
+            __atomic_store_n((uint32_t *)(dm_fps_state + 0x10), bits, __ATOMIC_RELAXED);
+        }
+    }
+}
+#endif
 
 uint64_t nvn_unimpl_c(nvn_slot_t *slot, uint64_t x0, uint64_t x1, uint64_t x2) {
     unsigned i = (unsigned)(slot - nvn_slot);
@@ -75,12 +112,12 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(DM_SECT("swnvn")))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(DM_SECT("swnvn")))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
@@ -116,7 +153,7 @@ static void *nvn_lookup(const char *name) {
 }
 
 // nvnBootstrapLoader is imported by main (defined in sdk); after it is forcibly taken over, the NVN driver in sdk is no longer referenced
-HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with a host null device (Metal behind it); the SDK's NVN driver does not run",
+HLE_FORCE("nvnBootstrapLoader", "the NVN graphics API is replaced wholesale with the host renderer; the SDK's NVN driver does not run",
           void *, h_nvnBootstrapLoader, const char *name) { return nvn_lookup(name); }
 
 // ---------- Boolean parameters: Switch callers do not extend them, only look at the low 8 bits ----------
@@ -1797,6 +1834,24 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
             if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
     LOG("[nvn] null device: %u names, %u implemented (%u semantic + %u empty, %u of them on the large host stack), the other %u go to the red-reporting stub",
         NVN_NFUNC, g_nsem + nnop, g_nsem, nnop, nbig, NVN_NFUNC - g_nsem - nnop);
+#ifdef __linux__
+    const char *hookshot = getenv("DM_NVN_HOOKSHOT");
+    if (hookshot && atoi(hookshot)) {
+        if (!hos_nvn_host_impl) die("DM_NVN_HOOKSHOT requires Hookshot's Vulkan host in this process");
+        g_hookshot_trace = getenv("DM_NVN_TRACE") != NULL;
+        unsigned bridged = 0;
+        for (unsigned i = 0; i < NVN_NFUNC; i++) {
+            // GetProcAddress must return native callable addresses, not lifted guest hostcalls.
+            if (!strcmp(nvn_names[i], "nvnDeviceGetProcAddress")) continue;
+            if (!strcmp(nvn_names[i], "nvnQueuePresentTexture")) g_hookshot_present_slot = i;
+            void *fn = hos_nvn_host_impl(nvn_names[i]);
+            g_hookshot_impl[i] = fn;
+            nvn_slot[i].fn = (void *)nvn_hookshot_entry;
+            bridged += fn != NULL;
+        }
+        LOG("[nvn] Hookshot native ABI bridge: %u procs; missing calls fail by name", bridged);
+    }
+#endif
 }
 
 // ---------- Window / present ----------

@@ -7,7 +7,24 @@
 #include <sys/resource.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/mman.h>
 #include <unistd.h>
+#ifdef __linux__
+#include "linux_guest_alias.h"
+static void dm_linux_call_on_stack(void *top, void (*fn)(void));
+__asm__(".text\n.globl dm_linux_call_on_stack\n.type dm_linux_call_on_stack, %function\n"
+        "dm_linux_call_on_stack:\n"
+        "stp x29, x30, [sp, #-16]!\n"
+        "mov x29, sp\n"
+        "mov x9, sp\n"
+        "mov sp, x0\n"
+        "str x9, [sp, #-16]!\n"
+        "blr x1\n"
+        "ldr x9, [sp]\n"
+        "mov sp, x9\n"
+        "ldp x29, x30, [sp], #16\n"
+        "ret\n.size dm_linux_call_on_stack, .-dm_linux_call_on_stack\n");
+#endif
 void probe_install(void); void hid_keys_init(void); void stubs_report(void); void crash_install(void); void guest_thread_init(void); void guest_gate_stack(int own_stack); uint32_t svc_thread_main_init(void);
 typedef void (*fn0)(void); typedef void (*fn2)(uint64_t, uint64_t); typedef void (*fnp)(void *);
 static void *req(const char *n){ void *p=guest_sym(n); if(!p) die("missing symbol %s", n); return p; }
@@ -39,6 +56,15 @@ static void guest_main(void) {
     LOG(">>> nnMain"); ((fn0)req("nnMain"))();
     LOG("nnMain returned");
 }
+
+#ifdef __linux__
+static void guest_main_low(void) {
+    enum { STACK_SIZE = 16 << 20, GUARD_SIZE = 16 << 10 };
+    uint8_t *stack = dm_linux_guest_alias_alloc(STACK_SIZE);
+    if (mprotect(stack, GUARD_SIZE, PROT_NONE)) die("native main stack guard");
+    dm_linux_call_on_stack(stack + STACK_SIZE, guest_main);
+}
+#endif
 
 struct dm_flags g_flag;
 uint64_t g_t0_ns;
@@ -113,8 +139,11 @@ static void host_preload(int argc, char **argv) {
     }
     crash_install();
     {   // Which build this is: the commit the packer stamped into the app (DMCommit; a run outside an app has none), the shader chain the host loads, the profile
-        CFBundleRef b = CFBundleGetMainBundle(); CFTypeRef c = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("DMCommit")) : NULL; char cs[64] = "not recorded";
+        char cs[64] = "not recorded";
+#ifdef __APPLE__
+        CFBundleRef b = CFBundleGetMainBundle(); CFTypeRef c = b ? CFBundleGetValueForInfoDictionaryKey(b, CFSTR("DMCommit")) : NULL;
         if (c && CFGetTypeID(c) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)c, cs, sizeof cs, kCFStringEncodingUTF8);
+#endif
         LOG("build: commit %s, shader chain %s, profile %s", cs, DMSH_CHAIN, DM_GAME_ID);
     }
     const char *race = getenv("DM_TEST_KEYRACE");
@@ -177,6 +206,16 @@ int main(int argc, char **argv) {
         LOG("host loading already finished early in the background (dm_host_preload_start)");
     } else host_preload(argc, argv);
     { void dm_fps_state_apply(void); dm_fps_state_apply(); }   // frame rate and render scale into the frame step state page (loader.c): the iOS launcher sets them after the loading began
+#ifdef __linux__
+    front_run(dm_linux_guest_alias_enabled() ? guest_main_low : guest_main);
+#else
     front_run(guest_main);
+#endif
     return 0;
 }
+#ifdef __linux__
+int dm_linux_run(const char *dir) {
+    char *argv[] = {"dmhost", (char *)dir, NULL};
+    return main(2, argv);
+}
+#endif

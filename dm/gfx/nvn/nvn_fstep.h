@@ -31,6 +31,11 @@
 #include <string.h>
 
 #define FSTEP_MAX 3           // the largest step: both games' own interval logic uses 1–3 (BotW clamps to [2, 3], TOTK picks 2 or 3), so their integer readers never see 4
+static inline int nvn_fstep_elapsed_ns(uint64_t now, uint64_t previous) {
+    if (!previous || now <= previous) return 1;
+    uint64_t step = (now - previous + 8333333) / 16666667;
+    return step < 1 ? 1 : step > FSTEP_MAX ? FSTEP_MAX : (int)step;
+}
 #define FSTEP_LATE 0.1        // a frame is late when it or its GPU work took this many vsyncs (1.7 ms) more than k: 53 fps is not 60 (start-to-start jitter on time is well below)
 #define FSTEP_SHORT_MAX 2.0  // a frame counts at most this many vsyncs past its hold toward the average (a load's stall is one long frame, not a rate)
 #define FSTEP_FIT 0.85        // a frame would fit k − 1 when its cost is at most this share of it

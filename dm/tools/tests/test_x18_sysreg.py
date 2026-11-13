@@ -27,7 +27,8 @@ PATCH_BASE, KEY_PAGE, TSD, STACK = 0x10000, 0x20000, 0x30000, 0x40000
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
 SLOT = {'K18': 0x40, 'KTLS': 0x48, 'KTLR': 0x50, 'KGATE': 0x58}   # byte offsets from tpidrro_el0, as the key page holds them
 scope = dict(vars(nso_asm), re=re, struct=struct, combinations=combinations, md=md,
-             patch=bytearray(), PATCH_BASE=PATCH_BASE, KEY_PAGE_OFF=KEY_PAGE, KEY_INDEX=KEY_INDEX, fix=[])
+             patch=bytearray(), PATCH_BASE=PATCH_BASE, KEY_PAGE_OFF=KEY_PAGE, KEY_INDEX=KEY_INDEX, fix=[],
+             MRS_HOSTTP=nso_asm.MRS_TPIDRRO)
 names = {'here', 'emit', 'emit_key_addr', 'emit_slot_addr', 'dis', 'regset', 'num', 'regs_in', 'pick',
          'site_slot_copy', 'site_sysreg_read', 'site_tpidr_write'}
 tree = ast.parse((TOOLS / 'patch_nso.py').read_text())
@@ -50,6 +51,14 @@ def block(word):
 
 
 class StaticShape(unittest.TestCase):
+    def test_linux_uses_host_tls_register(self):
+        scope['MRS_HOSTTP'] = nso_asm.MRS_TPIDR
+        try:
+            ins = list(md.disasm(block(MRS_TPIDR | 0), PATCH_BASE))
+            self.assertEqual(ins[1].op_str, 'x0, tpidr_el0')
+        finally:
+            scope['MRS_HOSTTP'] = nso_asm.MRS_TPIDRRO
+
     def test_x18_forms_never_name_x18(self):
         for word in (MRS_TPIDR | 18, MRS_TPIDRRO | 18, MSR_TPIDR | 18, MRS_CTR | 18):
             with self.subTest(word=word):
@@ -67,15 +76,17 @@ class StaticShape(unittest.TestCase):
 
 @unittest.skipIf(uc is None, 'optional ARM64 execution dependency: unicorn')
 class Run(unittest.TestCase):
-    def run_block(self, word, slots, regs=None):
+    def run_block(self, word, slots, regs=None, linux=False):
         assert uc is not None and arm is not None
+        scope['MRS_HOSTTP'] = nso_asm.MRS_TPIDR if linux else nso_asm.MRS_TPIDRRO
         code = block(word)
+        scope['MRS_HOSTTP'] = nso_asm.MRS_TPIDRRO
         mu = uc.Uc(uc.UC_ARCH_ARM64, uc.UC_MODE_ARM)
         for base in (0, PATCH_BASE, KEY_PAGE, TSD, STACK): mu.mem_map(base, 0x10000)
         mu.mem_write(PATCH_BASE, code)
         for k, i in KEY_INDEX.items(): mu.mem_write(KEY_PAGE + 8 * i, struct.pack('<Q', SLOT[k]))
         for k, v in slots.items(): mu.mem_write(TSD + SLOT[k], struct.pack('<Q', v))
-        mu.reg_write(arm.UC_ARM64_REG_TPIDRRO_EL0, TSD)
+        mu.reg_write(arm.UC_ARM64_REG_TPIDR_EL0 if linux else arm.UC_ARM64_REG_TPIDRRO_EL0, TSD)
         mu.reg_write(arm.UC_ARM64_REG_SP, STACK + 0x8000)
         regs = regs or {r: 0x1000 + r for r in range(31) if r != 18}
         for r, v in regs.items(): mu.reg_write(arm.UC_ARM64_REG_X0 + r, v)
@@ -91,6 +102,10 @@ class Run(unittest.TestCase):
 
     def test_mrs_x18_tpidrro_el0_writes_k18(self):
         out = self.run_block(MRS_TPIDRRO | 18, {'K18': 0x33200, 'KTLR': 0x7be3b6c000})
+        self.assertEqual(out['K18'], 0x7be3b6c000)
+
+    def test_linux_mrs_x18_tpidrro_el0_writes_k18(self):
+        out = self.run_block(MRS_TPIDRRO | 18, {'K18': 0x33200, 'KTLR': 0x7be3b6c000}, linux=True)
         self.assertEqual(out['K18'], 0x7be3b6c000)
 
     def test_msr_tpidr_el0_x18_reads_k18(self):

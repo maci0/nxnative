@@ -4,6 +4,9 @@
 // written in, and its ID once the thread table has one (guest_thread_set_id)
 #include "dm.h"
 #include <sys/mman.h>
+#ifdef __linux__
+#include "linux_tls.h"
+#endif
 #define TLS_SIZE 8192
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400
@@ -13,6 +16,9 @@ static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
 void guest_thread_init(void) {
     pthread_setspecific(g_key18, 0);
+#ifdef __linux__
+    dm_linux_slots[0] = 0;
+#endif
     // The TLS block and the thread-local region are freed when the thread exits. The guest overwrites the slots of the TLS / thread-local-region keys (it sets its own thread pointer), so they cannot be freed by the current value in the key:
     // the raw pointers that were allocated are recorded separately on this file's own key g_keyown and freed by its destructor (key destructors run at pthread_exit, like crash.c's signal alternate stack; the destructor only calls free, which is safe on a guest thread's small stack too).
     // They used not to be freed: every short-lived thread the game started leaked 8192 + 0x200 + 0x400 = 9728 bytes. The thread-local region and the current thread object are one block (the SDK may also overwrite the TLR[0x1f8] slot)
@@ -23,6 +29,9 @@ void guest_thread_init(void) {
     if (!own[0]) die("guest thread TLS block allocation failed");
     *(void **)(tlr + 0x1f8) = tlr + TLR_SIZE;               // current thread object
     pthread_setspecific(g_keytls, own[0]); pthread_setspecific(g_keytlr, tlr);
+#ifdef __linux__
+    dm_linux_slots[1] = (uint64_t)(uintptr_t)own[0]; dm_linux_slots[2] = (uint64_t)(uintptr_t)tlr;
+#endif
     void **prev = pthread_getspecific(g_keyown); if (prev) own_free(prev);   // re-initialised on the same thread: free the previous set first (the new one is what the slots now point to)
     pthread_setspecific(g_keyown, own);
 }
@@ -72,4 +81,7 @@ __attribute__((noinline)) void guest_gate_stack(int own_stack) {
     }
     dm_gate_top[k] = (uint64_t)(uintptr_t)top & ~15ull;
     pthread_setspecific(g_keygate, (void *)(dm_gate_stubs + 16 * k));
+#ifdef __linux__
+    dm_linux_slots[3] = (uint64_t)(uintptr_t)(dm_gate_stubs + 16 * k);
+#endif
 }

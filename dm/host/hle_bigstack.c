@@ -46,9 +46,9 @@ uintptr_t dm_bigstack_top(uintptr_t sp) {
 __asm__(
     ".text\n"
     ".p2align 2\n"
-    ".globl _dm_bigstack_enter\n"
-    ".private_extern _dm_bigstack_enter\n"
-    "_dm_bigstack_enter:\n"
+    ".globl " DM_SYM("dm_bigstack_enter") "\n"
+    DM_HIDDEN DM_SYM("dm_bigstack_enter") "\n"
+    DM_SYM("dm_bigstack_enter") ":\n"
     "    sub sp, sp, #0xa0\n"
     "    stp x29, x30, [sp, #0x90]\n"
     "    add x29, sp, #0x90\n"
@@ -62,7 +62,7 @@ __asm__(
     "    stp d4, d5, [sp, #0x70]\n"
     "    stp d6, d7, [sp, #0x80]\n"
     "    mov x0, sp\n"
-    "    bl _dm_bigstack_top\n"
+    "    bl " DM_SYM("dm_bigstack_top") "\n"
     "    mov x17, x0\n"
     "    ldp x0, x1, [sp, #0x00]\n"
     "    ldp x2, x3, [sp, #0x10]\n"
@@ -79,9 +79,9 @@ __asm__(
     "    mov sp, x17\n"
     "    stp x9, x10, [sp, #-16]!\n"
     "    blr x16\n"
-    ".globl _dm_bigstack_ret\n"
-    ".private_extern _dm_bigstack_ret\n"
-    "_dm_bigstack_ret:\n"
+    ".globl " DM_SYM("dm_bigstack_ret") "\n"
+    DM_HIDDEN DM_SYM("dm_bigstack_ret") "\n"
+    DM_SYM("dm_bigstack_ret") ":\n"
     "    ldr x9, [sp]\n"
     "    mov sp, x9\n"
     "    ldp x29, x30, [sp, #0x90]\n"
@@ -107,8 +107,14 @@ static void log_emit(const char *fmt, va_list *ap) {
     flockfile(stderr); vfprintf(stderr, fmt, *ap); fputc('\n', stderr); funlockfile(stderr);
 }
 void log_emit_bs(const char *fmt, va_list *ap);
-__asm__(".text\n.p2align 2\n.globl _log_emit_bs\n.private_extern _log_emit_bs\n_log_emit_bs:\n"
-        "    adrp x16, _log_emit@PAGE\n    add x16, x16, _log_emit@PAGEOFF\n    b _dm_bigstack_enter\n");
+__asm__(".text\n.p2align 2\n.globl " DM_SYM("log_emit_bs") "\n"
+        DM_HIDDEN DM_SYM("log_emit_bs") "\n" DM_SYM("log_emit_bs") ":\n"
+#ifdef __linux__
+        "    adrp x16, log_emit\n    add x16, x16, :lo12:log_emit\n"
+#else
+        "    adrp x16, _log_emit@PAGE\n    add x16, x16, _log_emit@PAGEOFF\n"
+#endif
+        "    b " DM_SYM("dm_bigstack_enter") "\n");
 void dm_log(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     log_emit_bs(fmt, &ap);

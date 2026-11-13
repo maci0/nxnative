@@ -9,7 +9,7 @@
 #include <errno.h>
 #include <TargetConditionals.h>
 #include <unistd.h>
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #endif
@@ -167,7 +167,7 @@ HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: the p
 // The iPhone cannot start a process: with DM_EXEC_OUT=<file> (main.m, an app holding several programs) the program index (4 bytes) and the parameters go to that file, the front end names the next
 // program and schedules a notification that opens the app (front_program_handoff), the app ends, and its next start reads the file and runs that program. A program the app lacks: its first
 // program, with no parameters. An app of one program cannot start itself again: the front end asks the player to open the app again (front_program_handoff with no DM_EXEC_OUT), and the app ends.
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 // cwd NULL: stay in this folder. The plan owns what it allocates (prog_plan_free): env (its entries point into environ, tsv or own), the table tsv that exe, cwd and arg point into,
 // and own, the two start keys. The host makes one plan and replaces itself with it (execve); a caller that makes another frees the first
 typedef struct { const char *exe, *cwd; char **argv, **env; char *argv2[3]; char self[4096]; char *tsv, *own[2]; } prog_plan;
@@ -274,9 +274,12 @@ static void oe_start(int index, const void *param, size_t n, int relaunch) {
     char hex[3 * 32 + 1] = "", call[192]; for (size_t i = 0; i < n && i < 32; i++) snprintf(hex + 3 * i, 4, " %02x", ((const uint8_t *)param)[i]);
     if (relaunch) snprintf(call, sizeof call, "%s", what); else snprintf(call, sizeof call, "%s(%d, %zu bytes of parameters:%s)", what, index, n, hex);
     int cur = (int)(DM_GAME_PROGRAM_ID & 0xf);
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     static prog_plan P;
     if (oe_plan(index, param, n, relaunch, &P, call)) { dm_host_shutdown_then(what, prog_exec, &P); for (;;) pause(); }
+#endif
+#ifdef __linux__
+    // shortcut: Linux cannot exec another game program yet; add an argv-preserving host relaunch when a multi-program game needs it.
 #endif
     const char *rec = getenv("DM_EXEC_OUT");
     if (rec && *rec) {   // the iPhone, an app holding several programs

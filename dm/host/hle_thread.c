@@ -11,6 +11,9 @@
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include <unistd.h>
 #include "dm.h"
+#ifdef __linux__
+#include "linux_tls.h"
+#endif
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
@@ -399,7 +402,12 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t || !atomic_load(&t->pause_req) || atomic_load(&t->svc_regs)) return;
-    ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+    ucontext_t *uc = uc_;
+#ifdef __linux__
+    const struct __darwin_arm_thread_state64 *ss = &DM_SS(uc);
+#else
+    const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+#endif
     if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return;   // in host code: do not stop; the requester resends
     pthread_mutex_lock(&G);
     if (t->pause_req) {
@@ -407,10 +415,19 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
         // x18 is the Apple platform register: the rewriter keeps the guest's x18 in its thread slot (patch_nso.py K18), and compiled game code may hold an object pointer there,
         // which a collector scanning this context (IL2CPP's, through GetThreadContext3) would otherwise not see. The rewriter's x18 sequences also park two registers up to 24 bytes
         // below sp for a few instructions, so the reported sp is 32 bytes lower: the collector scans the stack upward from it, and a few extra words cost a conservative scan nothing
-        t->ctx_x[18] = (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
+        t->ctx_x[18] =
+#ifdef __linux__
+            dm_linux_slots[0];
+#else
+            (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
+#endif
         t->ctx_fp = __darwin_arm_thread_state64_get_fp(*ss); t->ctx_lr = __darwin_arm_thread_state64_get_lr(*ss);
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
+#ifdef __linux__
+        memcpy(t->ctx_v, DM_NS(uc).__v, sizeof t->ctx_v); t->ctx_fpcr = DM_NS(uc).__fpcr; t->ctx_fpsr = DM_NS(uc).__fpsr;
+#else
         memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
+#endif
         t->ctx_ok = 1;
         while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); pthread_cond_wait(&t->pcv, &G); }
         t->paused = 0; t->ctx_ok = 0;
@@ -420,7 +437,13 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
-    t->svc_pc = pc; t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18); atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
+    t->svc_pc = pc;
+#ifdef __linux__
+    t->svc_x18 = dm_linux_slots[0];
+#else
+    t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
+#endif
+    atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) {
         pthread_mutex_lock(&G); qos_apply(t); pthread_mutex_unlock(&G);
     }

@@ -6,7 +6,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
+#ifdef __linux__
+#define DM_SYM(n) n
+#define DM_HIDDEN ".hidden "
+#else
+#define DM_SYM(n) "_" n
+#define DM_HIDDEN ".private_extern "
+#endif
 
 // Explicit host work does not occupy a guest core (Metal submission, or a blocked native codec lock). A contended host mutex must count as blocked: a signal's same-core handoff
 // can otherwise wait forever for a peer that needs the signaller's native lock. Uncontended locks retain guest ordering; the counter nests inside existing host work.
@@ -54,6 +64,23 @@ enum { R_AARCH64_ABS64 = 257, R_AARCH64_GLOB_DAT = 1025, R_AARCH64_JUMP_SLOT = 1
 #define ELF64_ST_BIND(i) ((i) >> 4)            // symbol binding: 0 = STB_LOCAL, 2 = STB_WEAK
 #define ELF64_ST_VISIBILITY(o) ((o) & 3)       // visibility: 0 = STV_DEFAULT
 enum { STB_LOCAL = 0, STB_WEAK = 2, STV_DEFAULT = 0 };
+
+// Text protection follows the host page size on Linux; Apple embedded code uses 16 KiB pages.
+#ifdef __linux__
+static inline uint64_t dm_code_page_mask(void) { return (uint64_t)getpagesize() - 1; }
+#else
+static inline uint64_t dm_code_page_mask(void) { return 0x3FFF; }
+#endif
+
+#ifndef DM_SS
+#define DM_SS(uc) ((uc)->uc_mcontext->__ss)
+#endif
+#ifndef DM_NS
+#define DM_NS(uc) ((uc)->uc_mcontext->__ns)
+#endif
+#ifndef DM_UC_ESR
+#define DM_UC_ESR(uc) ((uc)->uc_mcontext->__es.__esr)
+#endif
 
 // Run-time state of one NSO module
 typedef struct {

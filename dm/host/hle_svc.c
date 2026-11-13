@@ -12,6 +12,9 @@
 #include <sched.h>
 #include <time.h>
 #include <stdatomic.h>
+#ifdef __linux__
+#include "linux_guest_alias.h"
+#endif
 #include <mach/mach.h>
 #include <TargetConditionals.h>
 #include <CoreFoundation/CoreFoundation.h>   // the volume's free space with what the system can purge (guest_file_free_important)
@@ -28,7 +31,7 @@
 // with an 8 GB reservation, builds from developer accounts that cannot sign that entitlement (free accounts) would exit at this step.
 #define RESERVE DM_GAME_MEM_RESERVE   // SMBW: the heap needs only 1.47 GB, so the block stays at 5 GB (the total proven on a real device; a single 6 GB block can be reserved, but Metal etc. still need address space)
 static uint8_t *g_as;              // ASLR region base = the whole block
-static size_t g_reserve;           // its size: RESERVE less the profile's alias region plus the one in use (mem_init_once)
+static size_t g_reserve;           // its size: RESERVE less the profile's alias region plus the one in use, and on Android the heap region's growth to the app pool (mem_init_once)
 static uint8_t *g_heap; static _Atomic size_t g_heap_cur; static size_t g_heap_cap;
 static size_t g_heap_seen;        // the largest heap opened so far: with the guest in files, SetHeapSize zeroes a heap that grows back below it
 // The address range lies entirely within the currently opened (readable and writable) part of the guest heap: such reads need no kernel trap to check, memcpy directly (used where guest memory is read every tick, such as diag.c tk_rd)
@@ -74,7 +77,9 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 // Mac that and 8 GB, as it can swap instead. A file is unlinked before it is sized, so one left behind holds nothing. guest_file_thread stops the game when the room left falls under the minimum later.
 // What the game gives back goes PROT_NONE in the files and its blocks are punched out (guest_release, guest_file_punch; DM_GUEST_FILE_PUNCH=0 keeps them), and it reads 0 when it is opened again
 // (alias_initialize, SetHeapSize)
+#ifdef __APPLE__
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
+#endif
 #define GF_MAX 1024
 static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static int g_gf_n;                 // how many; 0 while the guest is anonymous. Set by mem_init_once, whose pthread_once orders it before every reader
@@ -83,6 +88,7 @@ static uint64_t g_gf_min_free;     // DM_GUEST_FILE_MIN_FREE in bytes: the free 
 static int g_gf_punch = 1;         // DM_GUEST_FILE_PUNCH=0: what the game gives back keeps its disk blocks (only PROT_NONE), as before
 static _Atomic uint64_t g_gf_punched;   // bytes given back as holes (guest_file_punch)
 
+#ifdef __APPLE__   // the guest in files is for the iPhone and the Mac: Android keeps it anonymous (guest_file_init)
 // Give the files' blocks under [lo, hi) (whole host pages, inside the block) back to the disk with F_PUNCHHOLE. Over a mapped range it also drops the pages, written out or still dirty, and they read 0
 // again (measured on the Mac: a 64 MB shared mapping, half written out: blocks 32 MB → 16 MB after punching a written and a dirty quarter, both read 0, and a later msync writes nothing for them). A
 // wired page (mlock, as under a Metal no-copy buffer the GPU still holds) keeps its bytes and is written back later, so the caller still zeroes the range when it is opened again (guest_zero, which
@@ -197,6 +203,9 @@ static void *guest_file_thread(void *arg) {
     }
     return NULL;
 }
+#else
+static void guest_file_punch(uintptr_t lo, uintptr_t hi) { (void)lo; (void)hi; }   // Android keeps the guest anonymous (g_gf_n stays 0): its callers never reach it
+#endif
 // Whether the guest goes in files: DM_GUEST_FILE when it is set, otherwise when the game's memory pool does not fit the room to the memory limit (room 0: no limit known, as on the Mac)
 static int guest_file_wanted(const char *e, uint64_t pool, uint64_t room) { return e && *e ? atoi(e) > 0 : room && pool > room; }
 // A new file of this process's own, never a link's target (O_EXCL, O_NOFOLLOW): one a dead process with the same number left is replaced
@@ -232,6 +241,7 @@ static int guest_file_class(int fd, char *why, size_t nwhy) {
 }
 #endif
 // The block in files of chunk bytes, the last one holding the rest: 1 with the files in g_gf_tab and mapped; 0 with why filled in, every file closed and the whole block anonymous PROT_NONE again, as reserved
+#ifdef __APPLE__
 static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *fs, char *why, size_t nwhy) {
     const double G = 1073741824.0; char path[1100]; int made = 0, ok = 1;
     const char *sep = dir[0] && dir[strlen(dir) - 1] == '/' ? "" : "/";
@@ -264,7 +274,12 @@ static int guest_files_map(const char *dir, size_t chunk, int n, struct statfs *
     if (mmap(g_as, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) != g_as) die("reserve guest AS again after DM_GUEST_FILE (errno %d)", errno);   // whatever the maps left there
     return 0;
 }
+#endif
 static void guest_file_init(void) {
+#ifndef __APPLE__
+    // Android: no Darwin temporary folder, statfs volume type, rusage or footprint parts, and no memory limit like iOS's to keep the guest under
+    const char *e = getenv("DM_GUEST_FILE"); if (e && atoi(e) > 0) LOG("[RED] [mem] guest memory: anonymous (DM_GUEST_FILE is not supported on Android)");
+#else
     const double G = 1073741824.0; const char *e = getenv("DM_GUEST_FILE"), *d = getenv("DM_GUEST_FILE_DIR"), *mf = getenv("DM_GUEST_FILE_MIN_FREE");
 #if TARGET_OS_IPHONE
     uint64_t room = os_proc_available_memory();
@@ -294,6 +309,7 @@ static void guest_file_init(void) {
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
     else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
+#endif
 }
 
 static void *alias_windows_thread(void *arg);
@@ -314,8 +330,27 @@ static void mem_init_once(void) {
 #endif
     const char *as = getenv("DM_ALIAS_SIZE");
     if (as && *as) { alias = (size_t)strtoull(as, NULL, 0); if (alias < 0x10000000 || (alias & (pg - 1))) die("DM_ALIAS_SIZE %s: at least 256 MB, in whole host pages", as); }
-    g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
+    size_t heap = RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000;
+#ifdef DM_ANDROID
+    // At least the app pool: Android builds never run the heap check that sizes a provisional profile's heap region (it boots the Mac host), and the guess can leave 128 MB
+    // (droidplay-core#291: Trails in the Sky 1st Chapter asks for 0x81200000). The region is address space; SetHeapSize's pool check still bounds the heap, as Horizon's does
+    size_t pool = ((size_t)DM_GAME_APP_POOL + 0x1fffff) & ~(size_t)0x1fffff;
+    if (heap < pool) heap = pool;
+#endif
+    g_reserve = 0x10000000 + heap + DM_GAME_MEM_STACK + alias;
+#ifdef __linux__
+    // NVN GPU addresses retain at most 39 guest bits; reserve the native heap inside that range.
+    if (dm_linux_guest_alias_enabled()) g_as = dm_linux_guest_alias_as(g_reserve);
+    else {
+        g_as = MAP_FAILED;
+        for (uintptr_t base = 0x2000000000ull; base + g_reserve < (1ull << 39); base += 0x2000000000ull) {
+            g_as = mmap((void *)base, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+            if (g_as != MAP_FAILED) break;
+        }
+    }
+#else
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
+#endif
     if (g_as == MAP_FAILED) die("reserve guest AS");
     guest_file_init();
     // Fixed partition (all inside the reserved block): 256 MB in front, the heap, the stacks, then the alias region. Mario: a heap region of 1.625 GB, stack 256 MB, alias 2.875 GB.
@@ -326,8 +361,8 @@ static void mem_init_once(void) {
     // SMBW also defines a 1792000 KB (1.75 GB) VirtualAddressMemory in HeapDef (System/HeapSize): it is subtracted from the memory pool before the heap is opened (SetHeapSize asks for only 0x5be00000),
     //   and resource loading then MapPhysicalMemory's into the alias region after the node area on demand. With a 1.25 GB alias region only about 256 MB was left there, and 3 MB-class layout archives (WipeCourseIn / WipeWarp)
     //   got no address, were skipped, and crashed on a null pointer when used (main +0x373e04). So alias = node area + 1.75 GB + slack; the heap needs only 1.47 GB, and 2.625 GB is plenty.
-    // The alias and stack sizes come from the game profile (mem_alias / mem_stack, the Mac's alias region as above), the heap takes the rest of mem_reserve
-    g_heap  = g_as + 0x10000000; g_heap_cap = RESERVE - DM_GAME_MEM_ALIAS - DM_GAME_MEM_STACK - 0x10000000;
+    // The alias and stack sizes come from the game profile (mem_alias / mem_stack, the Mac's alias region as above), the heap takes the rest of mem_reserve (on Android at least the app pool)
+    g_heap  = g_as + 0x10000000; g_heap_cap = heap;
     g_stack = g_heap + g_heap_cap; g_stack_cap = DM_GAME_MEM_STACK;
     g_alias = g_stack + g_stack_cap; g_alias_cap = alias;
     if (!(g_alias_bits = calloc((g_alias_cap >> 18) + 1, sizeof *g_alias_bits))) die("alias region page bitmap calloc");
@@ -484,6 +519,12 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // alias: the range lies in the alias region, where the game maps and unmaps the same ranges every frame (Zelda: about 0.5 GB a second): punching those at once would make every page fault
 // in again from a hole; they are only marked (g_alias_rel), and guest_file_sweep punches those still given back after a whole sweep interval. The heap's are punched at once
 static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
+#ifdef __linux__
+    if (dm_linux_guest_alias_enabled()) {
+        if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("native guest release mprotect errno %d", errno);
+        return madvise((void *)lo, hi - lo, MADV_REMOVE) == 0;
+    }
+#endif
     if (g_gf_n) {
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         if (g_gf_punch && !alias) guest_file_punch(lo, hi);
@@ -584,7 +625,7 @@ static int device_shared(uint64_t addr, uint64_t size, const char *what) {
                                                   what, (unsigned long long)addr, (unsigned long long)size, (unsigned long long)lo, (unsigned long long)hi);
     return hi != 0;
 }
-// Loader text/patch seals use 16 KiB boundaries, independently of host page size.
+// Loader text seals use dm_code_page_mask (16 KiB on Apple, the system page on Android); the patch area starts 64 KiB aligned.
 static void module_readonly_run(uint64_t off, uint64_t start, uint64_t end,
                                 uint64_t *lo, uint64_t *hi, uint64_t *perm) {
     if (start >= end) return;
@@ -593,7 +634,7 @@ static void module_readonly_run(uint64_t off, uint64_t start, uint64_t end,
     else { if (start > *lo) *lo = start; if (end < *hi) *hi = end; *perm &= ~UINT64_C(2); }
 }
 static void module_data_query(const module_t *m, uint64_t off, uint64_t *lo, uint64_t *hi, uint64_t *perm) {
-    module_readonly_run(off, 0, (m->text_end + 0x3fff) & ~UINT64_C(0x3fff), lo, hi, perm);
+    module_readonly_run(off, 0, (m->text_end + dm_code_page_mask()) & ~dm_code_page_mask(), lo, hi, perm);
     if (m->patch_off > 0) module_readonly_run(off, (uint64_t)m->patch_off & ~UINT64_C(0x3fff), m->size, lo, hi, perm);
     if (m->back_len) module_readonly_run(off, m->back_off, m->back_off + m->back_len, lo, hi, perm);
     module_readonly_run(off, m->key_page_off, m->key_page_off + m->key_page_size, lo, hi, perm);

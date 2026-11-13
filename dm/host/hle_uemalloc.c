@@ -23,6 +23,7 @@
 // 14 IsInternallyThreadSafe (1), 20 GetAllocationSize (stores a 32-bit size), 21 the TLS cache setup, 22 Trim (main+0x329a408). Its object is in the bss and its constructor is inlined into
 // the GMalloc setup, which the cut skips (the game's patches.py). It has no Binned3 name to find, so it keeps a row of fixed addresses, which runs only on the main build it was found in (AGENTS.md)
 #include "hle.h"
+#include <stdbool.h>
 #include <malloc/malloc.h>
 #include <mach/mach.h>
 #include <stdatomic.h>
